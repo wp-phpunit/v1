@@ -363,3 +363,44 @@ function _unregister_post_type( $cpt_name ) {
 function _unregister_taxonomy( $taxonomy_name ) {
 	unset( $GLOBALS['wp_taxonomies'][$taxonomy_name] );
 }
+
+function _cleanup_query_vars() {
+	// clean out globals to stop them polluting wp and wp_query
+	foreach ( $GLOBALS['wp']->public_query_vars as $v )
+		unset( $GLOBALS[$v] );
+
+	foreach ( $GLOBALS['wp']->private_query_vars as $v )
+		unset( $GLOBALS[$v] );
+
+	foreach ( get_taxonomies( array() , 'objects' ) as $t ) {
+		if ( ! empty( $t->query_var ) )
+			$GLOBALS['wp']->add_query_var( $t->query_var );
+	}
+
+	foreach ( get_post_types( array() , 'objects' ) as $t ) {
+		if ( ! empty( $t->query_var ) )
+			$GLOBALS['wp']->add_query_var( $t->query_var );
+	}
+}
+
+function _clean_term_filters() {
+	remove_filter( 'get_terms',     array( 'Featured_Content', 'hide_featured_term'     ), 10, 2 );
+	remove_filter( 'get_the_terms', array( 'Featured_Content', 'hide_the_featured_term' ), 10, 3 );
+}
+
+/**
+ * Special class for exposing protected wpdb methods we need to access
+ */
+class wpdb_exposed_methods_for_testing extends wpdb {
+	public function __construct() {
+		global $wpdb;
+		$this->dbh = $wpdb->dbh;
+		$this->ready = true;
+		$this->field_types = $wpdb->field_types;
+		$this->charset = $wpdb->charset;
+	}
+
+	public function __call( $name, $arguments ) {
+		return call_user_func_array( array( $this, $name ), $arguments );
+	}
+}
