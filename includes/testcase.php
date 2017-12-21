@@ -11,6 +11,9 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 	protected $expected_doing_it_wrong = array();
 	protected $caught_doing_it_wrong = array();
 
+	protected static $hooks_saved = array();
+	protected static $ignore_files;
+
 	/**
 	 * @var WP_UnitTest_Factory
 	 */
@@ -18,6 +21,14 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 
 	function setUp() {
 		set_time_limit(0);
+
+		if ( ! self::$ignore_files ) {
+			self::$ignore_files = $this->scan_user_uploads();
+		}
+
+		if ( ! self::$hooks_saved ) {
+			$this->_backup_hooks();
+		}
 
 		global $wpdb;
 		$wpdb->suppress_errors = false;
@@ -32,12 +43,21 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 	}
 
 	function tearDown() {
-		global $wpdb;
+		global $wpdb, $wp_query, $post;
 		$this->expectedDeprecated();
 		$wpdb->query( 'ROLLBACK' );
-		remove_filter( 'dbdelta_create_queries', array( $this, '_create_temporary_tables' ) );
+		if ( is_multisite() ) {
+			while ( ms_is_switched() ) {
+				restore_current_blog();
+			}
+		}
+		$wp_query = new WP_Query();
+		$post = null;
+		remove_theme_support( 'html5' );
+		remove_filter( 'query', array( $this, '_create_temporary_tables' ) );
 		remove_filter( 'query', array( $this, '_drop_temporary_tables' ) );
 		remove_filter( 'wp_die_handler', array( $this, 'get_wp_die_handler' ) );
+		$this->_restore_hooks();
 	}
 
 	function clean_up_global_scope() {
@@ -46,6 +66,44 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 		$this->flush_cache();
 	}
 
+	/**
+	 * Saves the action and filter-related globals so they can be restored later.
+	 *
+	 * Stores $merged_filters, $wp_actions, $wp_current_filter, and $wp_filter
+	 * on a class variable so they can be restored on tearDown() using _restore_hooks().
+	 *
+	 * @global array $merged_filters
+	 * @global array $wp_actions
+	 * @global array $wp_current_filter
+	 * @global array $wp_filter
+	 * @return void
+	 */
+	protected function _backup_hooks() {
+		$globals = array( 'merged_filters', 'wp_actions', 'wp_current_filter', 'wp_filter' );
+		foreach ( $globals as $key ) {
+			self::$hooks_saved[ $key ] = $GLOBALS[ $key ];
+		}
+	}
+
+	/**
+	 * Restores the hook-related globals to their state at setUp()
+	 * so that future tests aren't affected by hooks set during this last test.
+	 *
+	 * @global array $merged_filters
+	 * @global array $wp_actions
+	 * @global array $wp_current_filter
+	 * @global array $wp_filter
+	 * @return void
+	 */
+	protected function _restore_hooks() {
+		$globals = array( 'merged_filters', 'wp_actions', 'wp_current_filter', 'wp_filter' );
+		foreach ( $globals as $key ) {
+			if ( isset( self::$hooks_saved[ $key ] ) ) {
+				$GLOBALS[ $key ] = self::$hooks_saved[ $key ];
+			}
+		}
+	}
+	
 	function flush_cache() {
 		global $wp_object_cache;
 		$wp_object_cache->group_ops = array();
@@ -64,17 +122,19 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 		global $wpdb;
 		$wpdb->query( 'SET autocommit = 0;' );
 		$wpdb->query( 'START TRANSACTION;' );
-		add_filter( 'dbdelta_create_queries', array( $this, '_create_temporary_tables' ) );
+		add_filter( 'query', array( $this, '_create_temporary_tables' ) );
 		add_filter( 'query', array( $this, '_drop_temporary_tables' ) );
 	}
 
-	function _create_temporary_tables( $queries ) {
-		return str_replace( 'CREATE TABLE', 'CREATE TEMPORARY TABLE', $queries );
+	function _create_temporary_tables( $query ) {
+		if ( 'CREATE TABLE' === substr( trim( $query ), 0, 12 ) )
+			return substr_replace( trim( $query ), 'CREATE TEMPORARY TABLE', 0, 12 );
+		return $query;
 	}
 
 	function _drop_temporary_tables( $query ) {
-		if ( 'DROP TABLE' === substr( $query, 0, 10 ) )
-			return 'DROP TEMPORARY TABLE ' . substr( $query, 10 );
+		if ( 'DROP TABLE' === substr( trim( $query ), 0, 10 ) )
+			return substr_replace( trim( $query ), 'DROP TEMPORARY TABLE', 0, 10 );
 		return $query;
 	}
 
@@ -217,7 +277,7 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 	function knownWPBug( $ticket_id ) {
 		if ( WP_TESTS_FORCE_KNOWN_BUGS || in_array( $ticket_id, self::$forced_tickets ) )
 			return;
-		if ( ! TracTickets::isTracTicketClosed( 'http://core.trac.wordpress.org', $ticket_id ) )
+		if ( ! TracTickets::isTracTicketClosed( 'https://core.trac.wordpress.org', $ticket_id ) )
 			$this->markTestSkipped( sprintf( 'WordPress Ticket #%d is not fixed', $ticket_id ) );
 	}
 
@@ -227,7 +287,7 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 	function knownUTBug( $ticket_id ) {
 		if ( WP_TESTS_FORCE_KNOWN_BUGS || in_array( 'UT' . $ticket_id, self::$forced_tickets ) )
 			return;
-		if ( ! TracTickets::isTracTicketClosed( 'http://unit-tests.trac.wordpress.org', $ticket_id ) )
+		if ( ! TracTickets::isTracTicketClosed( 'https://unit-tests.trac.wordpress.org', $ticket_id ) )
 			$this->markTestSkipped( sprintf( 'Unit Tests Ticket #%d is not fixed', $ticket_id ) );
 	}
 
@@ -237,7 +297,7 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 	function knownPluginBug( $ticket_id ) {
 		if ( WP_TESTS_FORCE_KNOWN_BUGS || in_array( 'Plugin' . $ticket_id, self::$forced_tickets ) )
 			return;
-		if ( ! TracTickets::isTracTicketClosed( 'http://plugins.trac.wordpress.org', $ticket_id ) )
+		if ( ! TracTickets::isTracTicketClosed( 'https://plugins.trac.wordpress.org', $ticket_id ) )
 			$this->markTestSkipped( sprintf( 'WordPress Plugin Ticket #%d is not fixed', $ticket_id ) );
 	}
 
@@ -314,5 +374,55 @@ class WP_UnitTestCase extends PHPUnit_Framework_TestCase {
 		if ( count($not_false) )
 			$message .= implode( $not_false, ', ' ) . ' should be false.';
 		$this->assertTrue( $passed, $message );
+	}
+
+	function unlink( $file ) {
+		$exists = is_file( $file );
+		if ( $exists && ! in_array( $file, self::$ignore_files ) ) {
+			//error_log( $file );
+			unlink( $file );
+		} elseif ( ! $exists ) {
+			$this->fail( "Trying to delete a file that doesn't exist: $file" );
+		}
+	}
+
+	function rmdir( $path ) {
+		$files = $this->files_in_dir( $path );
+		foreach ( $files as $file ) {
+			if ( ! in_array( $file, self::$ignore_files ) ) {
+				$this->unlink( $file );
+			}
+		}
+	}
+
+	function remove_added_uploads() {
+		// Remove all uploads.
+		$uploads = wp_upload_dir();
+		$this->rmdir( $uploads['basedir'] );
+	}
+
+	function files_in_dir( $dir ) {
+		$files = array();
+
+		$iterator = new RecursiveDirectoryIterator( $dir );
+		$objects = new RecursiveIteratorIterator( $iterator );
+		foreach ( $objects as $name => $object ) {
+			if ( is_file( $name ) ) {
+				$files[] = $name;
+			}
+		}
+
+		return $files;
+	}
+
+	function scan_user_uploads() {
+		static $files = array();
+		if ( ! empty( $files ) ) {
+			return $files;
+		}
+
+		$uploads = wp_upload_dir();
+		$files = $this->files_in_dir( $uploads['basedir'] );
+		return $files;
 	}
 }
