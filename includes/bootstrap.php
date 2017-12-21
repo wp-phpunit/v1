@@ -3,6 +3,12 @@
  * Installs WordPress for running the tests and loads WordPress and the test libraries
  */
 
+/**
+ * Compatibility with PHPUnit 6+
+ */
+if ( class_exists( 'PHPUnit\Runner\Version' ) ) {
+	require_once dirname( __FILE__ ) . '/phpunit6-compat.php';
+}
 
 $config_file_path = dirname( dirname( __FILE__ ) );
 if ( ! file_exists( $config_file_path . '/wp-tests-config.php' ) ) {
@@ -16,14 +22,21 @@ $config_file_path .= '/wp-tests-config.php';
  * Globalize some WordPress variables, because PHPUnit loads this file inside a function
  * See: https://github.com/sebastianbergmann/phpunit/issues/325
  */
-global $wpdb, $current_site, $current_blog, $wp_rewrite, $shortcode_tags, $wp, $phpmailer;
+global $wpdb, $current_site, $current_blog, $wp_rewrite, $shortcode_tags, $wp, $phpmailer, $wp_theme_directories;
 
-if ( !is_readable( $config_file_path ) ) {
-	die( "ERROR: wp-tests-config.php is missing! Please use wp-tests-config-sample.php to create a config file.\n" );
+if ( ! is_readable( $config_file_path ) ) {
+	echo "ERROR: wp-tests-config.php is missing! Please use wp-tests-config-sample.php to create a config file.\n";
+	exit( 1 );
 }
 require_once $config_file_path;
+require_once dirname( __FILE__ ) . '/functions.php';
 
+tests_reset__SERVER();
+
+define( 'WP_TESTS_TABLE_PREFIX', $table_prefix );
 define( 'DIR_TESTDATA', dirname( __FILE__ ) . '/../data' );
+
+define( 'WP_LANG_DIR', DIR_TESTDATA . '/languages' );
 
 if ( ! defined( 'WP_TESTS_FORCE_KNOWN_BUGS' ) )
 	define( 'WP_TESTS_FORCE_KNOWN_BUGS', false );
@@ -34,38 +47,39 @@ define( 'DISABLE_WP_CRON', true );
 define( 'WP_MEMORY_LIMIT', -1 );
 define( 'WP_MAX_MEMORY_LIMIT', -1 );
 
-$_SERVER['SERVER_PROTOCOL'] = 'HTTP/1.1';
-$_SERVER['HTTP_HOST'] = WP_TESTS_DOMAIN;
+define( 'REST_TESTS_IMPOSSIBLY_HIGH_NUMBER', 99999999 );
+
 $PHP_SELF = $GLOBALS['PHP_SELF'] = $_SERVER['PHP_SELF'] = '/index.php';
 
-if ( "1" == getenv( 'WP_MULTISITE' ) ||
-	( defined( 'WP_TESTS_MULTISITE') && WP_TESTS_MULTISITE ) ) {
-	$multisite = true;
-} else {
-	$multisite = false;
-}
+// Should we run in multisite mode?
+$multisite = '1' == getenv( 'WP_MULTISITE' );
+$multisite = $multisite || ( defined( 'WP_TESTS_MULTISITE') && WP_TESTS_MULTISITE );
+$multisite = $multisite || ( defined( 'MULTISITE' ) && MULTISITE );
 
 // Override the PHPMailer
 require_once( dirname( __FILE__ ) . '/mock-mailer.php' );
-$phpmailer = new MockPHPMailer(); 
+$phpmailer = new MockPHPMailer( true );
+
+if ( ! defined( 'WP_DEFAULT_THEME' ) ) {
+	define( 'WP_DEFAULT_THEME', 'default' );
+}
+$wp_theme_directories = array( DIR_TESTDATA . '/themedir1' );
 
 system( WP_PHP_BINARY . ' ' . escapeshellarg( dirname( __FILE__ ) . '/install.php' ) . ' ' . escapeshellarg( $config_file_path ) . ' ' . $multisite );
 
 if ( $multisite ) {
 	echo "Running as multisite..." . PHP_EOL;
-	define( 'MULTISITE', true );
-	define( 'SUBDOMAIN_INSTALL', false );
-	define( 'DOMAIN_CURRENT_SITE', WP_TESTS_DOMAIN );
-	define( 'PATH_CURRENT_SITE', '/' );
-	define( 'SITE_ID_CURRENT_SITE', 1 );
-	define( 'BLOG_ID_CURRENT_SITE', 1 );
+	defined( 'MULTISITE' ) or define( 'MULTISITE', true );
+	defined( 'SUBDOMAIN_INSTALL' ) or define( 'SUBDOMAIN_INSTALL', false );
 	$GLOBALS['base'] = '/';
 } else {
 	echo "Running as single site... To run multisite, use -c tests/phpunit/multisite.xml" . PHP_EOL;
 }
 unset( $multisite );
 
-require_once dirname( __FILE__ ) . '/functions.php';
+$GLOBALS['_wp_die_disabled'] = false;
+// Allow tests to override wp_die
+tests_add_filter( 'wp_die_handler', '_wp_die_handler_filter' );
 
 // Preset WordPress options defined in bootstrap file.
 // Used to activate themes, plugins, as well as  other settings.
@@ -87,16 +101,21 @@ require_once ABSPATH . '/wp-settings.php';
 _delete_all_posts();
 
 require dirname( __FILE__ ) . '/testcase.php';
+require dirname( __FILE__ ) . '/testcase-rest-api.php';
+require dirname( __FILE__ ) . '/testcase-rest-controller.php';
+require dirname( __FILE__ ) . '/testcase-rest-post-type-controller.php';
 require dirname( __FILE__ ) . '/testcase-xmlrpc.php';
 require dirname( __FILE__ ) . '/testcase-ajax.php';
+require dirname( __FILE__ ) . '/testcase-canonical.php';
 require dirname( __FILE__ ) . '/exceptions.php';
 require dirname( __FILE__ ) . '/utils.php';
+require dirname( __FILE__ ) . '/spy-rest-server.php';
 
 /**
  * A child class of the PHP test runner.
  *
- * Not actually used as a runner. Rather, used to access the protected
- * longOptions property, to parse the arguments passed to the script.
+ * Used to access the protected longOptions property, to parse the arguments
+ * passed to the script.
  *
  * If it is determined that phpunit was called with a --group that corresponds
  * to an @ticket annotation (such as `phpunit --group 12345` for bugs marked
@@ -105,31 +124,68 @@ require dirname( __FILE__ ) . '/utils.php';
  * If WP_TESTS_FORCE_KNOWN_BUGS is already set in wp-tests-config.php, then
  * how you call phpunit has no effect.
  */
-class WP_PHPUnit_TextUI_Command extends PHPUnit_TextUI_Command {
+class WP_PHPUnit_Util_Getopt extends PHPUnit_Util_Getopt {
+	protected $longOptions = array(
+	  'exclude-group=',
+	  'group=',
+	);
 	function __construct( $argv ) {
-		$options = PHPUnit_Util_Getopt::getopt(
-			$argv,
-			'd:c:hv',
-			array_keys( $this->longOptions )
+		array_shift( $argv );
+		$options = array();
+		while ( list( $i, $arg ) = each( $argv ) ) {
+			try {
+				if ( strlen( $arg ) > 1 && $arg[0] === '-' && $arg[1] === '-' ) {
+					PHPUnit_Util_Getopt::parseLongOption( substr( $arg, 2 ), $this->longOptions, $options, $argv );
+				}
+			}
+			catch ( PHPUnit_Framework_Exception $e ) {
+				// Enforcing recognized arguments or correctly formed arguments is
+				// not really the concern here.
+				continue;
+			}
+		}
+
+		$skipped_groups = array(
+			'ajax' => true,
+			'ms-files' => true,
+			'external-http' => true,
 		);
-		$ajax_message = true;
-		foreach ( $options[0] as $option ) {
+
+		foreach ( $options as $option ) {
 			switch ( $option[0] ) {
 				case '--exclude-group' :
-					$ajax_message = false;
+					foreach ( $skipped_groups as $group_name => $skipped ) {
+						$skipped_groups[ $group_name ] = false;
+					}
 					continue 2;
 				case '--group' :
 					$groups = explode( ',', $option[1] );
 					foreach ( $groups as $group ) {
-						if ( is_numeric( $group ) || preg_match( '/^(UT|Plugin)\d+$/', $group ) )
+						if ( is_numeric( $group ) || preg_match( '/^(UT|Plugin)\d+$/', $group ) ) {
 							WP_UnitTestCase::forceTicket( $group );
+						}
 					}
-					$ajax_message = ! in_array( 'ajax', $groups );
+
+					foreach ( $skipped_groups as $group_name => $skipped ) {
+						if ( in_array( $group_name, $groups ) ) {
+							$skipped_groups[ $group_name ] = false;
+						}
+					}
 					continue 2;
 			}
 		}
-		if ( $ajax_message )
-			echo "Not running ajax tests... To execute these, use --group ajax." . PHP_EOL;
+
+		$skipped_groups = array_filter( $skipped_groups );
+		foreach ( $skipped_groups as $group_name => $skipped ) {
+			echo sprintf( 'Not running %1$s tests. To execute these, use --group %1$s.', $group_name ) . PHP_EOL;
+		}
+
+		if ( ! isset( $skipped_groups['external-http'] ) ) {
+			echo PHP_EOL;
+			echo 'External HTTP skipped tests can be caused by timeouts.' . PHP_EOL;
+			echo 'If this changeset includes changes to HTTP, make sure there are no timeouts.' . PHP_EOL;
+			echo PHP_EOL;
+		}
     }
 }
-new WP_PHPUnit_TextUI_Command( $_SERVER['argv'] );
+new WP_PHPUnit_Util_Getopt( $_SERVER['argv'] );
